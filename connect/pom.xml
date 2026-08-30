@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Assembles the Apache Iceberg Kafka Connect sink plugin.
+
+  The Iceberg project does not publish a prebuilt "runtime" zip to Maven Central
+  or to downloads.apache.org, so we resolve the connector plus the extras it
+  needs at runtime (Parquet writers, S3 FileIO, the shaded AWS SDK) and copy the
+  whole dependency set into a single plugin directory for Connect.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>iceberg-connect-plugin</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <iceberg.version>1.10.1</iceberg.version>
+    <hadoop.version>3.4.2</hadoop.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-kafka-connect</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-kafka-connect-transforms</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <!-- Parquet is the default write format for Iceberg tables. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-parquet</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <!-- S3FileIO, so the sink can write straight to MinIO/S3 without Hadoop's s3a. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws-bundle</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <!--
+      Parquet's writer API is built on Hadoop's Configuration/Path types, so a
+      trimmed hadoop-common has to be on the classpath even though nothing here
+      talks to HDFS. The exclusions drop the server-side halves we never load.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${hadoop.version}</version>
+      <exclusions>
+        <exclusion><groupId>org.apache.hadoop</groupId><artifactId>hadoop-auth</artifactId></exclusion>
+        <exclusion><groupId>org.apache.hadoop.thirdparty</groupId><artifactId>hadoop-shaded-protobuf_3_25</artifactId></exclusion>
+        <exclusion><groupId>org.apache.zookeeper</groupId><artifactId>zookeeper</artifactId></exclusion>
+        <exclusion><groupId>org.apache.curator</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.apache.kerby</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.eclipse.jetty</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>javax.servlet</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>com.sun.jersey</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.apache.avro</groupId><artifactId>avro</artifactId></exclusion>
+        <exclusion><groupId>log4j</groupId><artifactId>*</artifactId></exclusion>
+        <exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-reload4j</artifactId></exclusion>
+        <exclusion><groupId>ch.qos.reload4j</groupId><artifactId>reload4j</artifactId></exclusion>
+        <exclusion><groupId>com.google.protobuf</groupId><artifactId>protobuf-java</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,274 @@
+# ---------------------------------------------------------------------------
+#  Real-Time CDC Pipeline:  Postgres -> Debezium -> Kafka -> Iceberg
+#
+#  Postgres  writes row changes to its write-ahead log
+#  Debezium  tails that log through a logical replication slot
+#  Kafka     durably buffers one topic per source table
+#  Iceberg   sink connector commits those events as Iceberg snapshots
+#  MinIO     stands in for S3 as the warehouse storage layer
+#  Trino     queries the resulting tables
+# ---------------------------------------------------------------------------
+
+name: cdc-iceberg
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Source of truth. wal_level=logical is what makes CDC possible at all:
+  # without it Postgres never writes the row images Debezium needs to decode.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: cdc-pg
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DEBEZIUM_USER: ${DEBEZIUM_USER}
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  # Single-node Kafka in KRaft mode (no ZooKeeper).
+  #   kafka:29092     -> other containers
+  #   localhost:19092 -> your laptop
+  # -------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.9.9
+    container_name: cdc-kafka
+    ports:
+      - "${KAFKA_PORT}:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 20
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Optional. Only needed when CDC_CONVERTER is set to Avro -- with the default
+  # JSON converter the schema travels inline with each message and this service
+  # never starts. Bring it up with:  docker compose --profile avro up -d
+  # -------------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.9
+    container_name: cdc-schema-registry
+    profiles: ["avro"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${SCHEMA_REGISTRY_PORT}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  # S3-compatible object storage holding the Iceberg warehouse.
+  # -------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: cdc-minio
+    # A top-level directory in the data dir *is* a bucket, so the warehouse
+    # exists the moment the server starts -- no separate init container.
+    entrypoint: ["sh", "-c", "mkdir -p /data/warehouse && exec minio server /data --console-address :9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DOMAIN: minio
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  # Iceberg REST catalog. It owns the pointer to each table's current metadata
+  # file, which is what makes a commit atomic and every reader consistent.
+  # Table metadata lives in SQLite on a volume so it survives a restart.
+  # -------------------------------------------------------------------------
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: cdc-iceberg-rest
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "${ICEBERG_REST_PORT}:8181"
+    environment:
+      CATALOG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      # WAL + a busy timeout: the sink commits several tables concurrently and
+      # plain SQLite answers the second writer with SQLITE_BUSY.
+      CATALOG_URI: "jdbc:sqlite:file:/tmp/iceberg_catalog.db?journal_mode=WAL&busy_timeout=10000&synchronous=NORMAL"
+      CATALOG_CLIENTS: "1"
+      CATALOG_JDBC_SCHEMA__VERSION: V1
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    volumes:
+      - icebergcatalog:/tmp
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8181"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  # One Connect worker running both connectors: Debezium reads Postgres,
+  # the Iceberg sink writes the lakehouse. Built locally -- see connect/.
+  # -------------------------------------------------------------------------
+  connect:
+    build:
+      context: ./connect
+    image: cdc-iceberg/connect:1.0
+    container_name: cdc-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+    ports:
+      - "${CONNECT_PORT}:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: cdc-connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Set once in .env. schemas.enable matters to the JSON converter and is
+      # ignored by Avro; schema.registry.url is the other way round -- so both
+      # can sit here and the one variable decides the format.
+      CONNECT_KEY_CONVERTER: ${CDC_CONVERTER}
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "${CDC_JSON_SCHEMAS_ENABLED:-true}"
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER: ${CDC_CONVERTER}
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "${CDC_JSON_SCHEMAS_ENABLED:-true}"
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      # Connect's own internal topics stay plain JSON.
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      # How often Connect hands the sink a (possibly empty) batch. The Iceberg
+      # sink can only act on a commit request while inside one of those calls,
+      # so the 60s default would stall the first commit long after the data is
+      # already buffered. Match it to the commit interval instead.
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: "10000"
+      # Credentials the Iceberg sink's S3FileIO uses to write data files.
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
+      CONNECT_LOG4J_LOGGERS: >-
+        org.reflections=ERROR,
+        org.apache.kafka.connect.runtime.WorkerSinkTask=INFO,
+        io.debezium=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # -------------------------------------------------------------------------
+  # SQL over the Iceberg tables the sink produces.
+  # -------------------------------------------------------------------------
+  trino:
+    image: trinodb/trino:483
+    container_name: cdc-trino
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    ports:
+      - "${TRINO_PORT}:8080"
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # -------------------------------------------------------------------------
+  # Browser view of topics, schemas, connectors and consumer lag.
+  # -------------------------------------------------------------------------
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: cdc-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cdc-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  pgdata:
+  kafkadata:
+  miniodata:
+  icebergcatalog:
